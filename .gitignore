@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Data and outputs
+data/raw/
+runs/
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+.DS_Store
+*.log
