@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 from rank_bm25 import BM25Okapi
+import re
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHUNKS_PATH = REPO_ROOT / "data" / "processed" / "chunks.jsonl"
@@ -26,9 +27,9 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 
 def tokenize(text: str) -> List[str]:
-    # Simple tokenization: lowercase whitespace tokens.
-    # Later upgrades: stopwords, stemming, better tokenization.
-    return [t.lower() for t in text.split() if t.strip()]
+    # Goal: normalize text so "benefits," and "benefits" match.
+    # Why: BM25 is lexical; small tokenization mistakes cause misses.
+    return re.findall(r"[a-z0-9]+", text.lower())
 
 
 def main() -> None:
