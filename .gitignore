@@ -1,19 +1,21 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-
-# Virtual environment
-.venv/
-
-# Data and outputs
+# Data (never commit)
 data/raw/
+data/interim/
+data/processed/
+
+# Experiment outputs
 runs/
 
-# IDE
+# Hugging Face / model caches (if you ever set them locally)
+.hf/
+.cache/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
 .vscode/
 .idea/
-
-# Misc
-.DS_Store
-*.log
