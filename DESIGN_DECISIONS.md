@@ -1,17 +1,54 @@
-Decision: Use BM25Okapi + “safe stopword” tokenizer for lexical baseline (V1)
+# Design Decisions
 
-Context: Need a debuggable retrieval baseline before dense/hybrid methods.
+This document records key choices, tradeoffs considered, and why we made them.
 
-Options tested (validation, K=10):
+## 1) Document unit + grounding definition
+**Decision:** treat gold as span-level evidence from Doc2Dial; retrieval is “correct” if a retrieved chunk overlaps gold span(s).  
+**Why:** prevents “lucky retrieval” of vaguely relevant text; aligns retrieval scoring with evidence needed for generation.
 
-A1 BM25Okapi + basic tokenizer: Recall@10 0.5365, MRR 0.3468, nDCG@10 0.3913
+Alternatives:
+- document-level gold (too coarse; inflates recall)
+- answer-string match (fragile; requires clean answers)
 
-A3 BM25Okapi + safe stopwords (keep negations/modals): Recall@10 0.5582, MRR 0.3561, nDCG@10 0.4031 (winner)
+## 2) Chunking strategy (300–400 tokens, ~50 overlap)
+**Decision:** chunk docs into ~300–400 tokens with ~50 token overlap.  
+**Why:** balances:
+- enough context for semantic coherence
+- manageable granularity for retrieval
+- overlap reduces boundary-splitting where key evidence straddles chunks
 
-A4 BM25Plus variants: ~no gain vs Okapi
+Tradeoff: overlap can inflate recall if too large; kept modest.
 
-Decision: Adopt A3 as default lexical baseline.
+## 3) Retriever ladder: BM25 → Dense → Hybrid (RRF)
+**Decision:** establish BM25 baseline; add dense embeddings; fuse with Reciprocal Rank Fusion.  
+**Why:**
+- BM25 captures rare keyword matches and exact phrasing
+- dense captures semantic paraphrases
+- hybrid improves recall/robustness with minimal complexity
 
-Why: Best metrics with minimal complexity; improvements come from normalization rather than swapping BM25 variant.
+## 4) Hybrid operating point (k=30)
+**Decision:** use k=30 as candidate set for downstream steps.  
+**Why:** higher recall candidate pool for reranking/generation; still computationally manageable.
 
-How we’ll revisit: After dense retrieval + reranking, re-run the same eval harness.
+## 5) Confidence proxy: reranker margin > top1 score
+**Decision:** prefer margin(top1-top2) as high-confidence signal.  
+**Why:** separation between best and runner-up correlates with unambiguous evidence; top1 alone is often poorly calibrated.
+
+## 6) Tiered answering policy (A/B/C)
+**Decision:** route queries based on confidence:
+- **A_high:** margin ≥ 1 → strict grounded answer
+- **B_medium:** top1 ≥ 3 & margin < 1 → evidence-first + cite-or-abstain
+- **C_low:** abstain + show top passages
+
+**Why:** achieves balanced coverage with high reliability, and provides useful fallback for low-confidence cases without hallucination.
+
+## 7) Evidence-first generation + “no citation → abstain”
+**Decision:** in Tier B, enforce short evidence-first answers and abstain if no valid citations returned.  
+**Why:** removes unsupported fluent answers; improves groundedness and citation validity.
+
+## 8) Evaluation: LLM-as-judge + calibration
+**Decision:** use judge scores for correctness/grounded/citation-valid and evaluate coverage–reliability tradeoffs.  
+**Why:** scalable, structured evaluation for end-to-end behavior (retrieval metrics alone are insufficient).
+
+## Extension: PyTorch local embeddings (planned)
+**Goal:** implement local embedding model + ANN index (FAISS) and compare with hosted embeddings on quality/cost/latency.
