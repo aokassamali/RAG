@@ -1,112 +1,142 @@
 # RAG Reliability Lab
 
-A small, end-to-end lab for **retrieval + grounded generation + reliability evaluation**.  
-Focus: measurable improvements via **retrieval baselines**, **hybrid retrieval**, **reranking**, **selective answering**, and **LLM-as-judge** evaluation.
+A small, end-to-end lab for **retrieval → evidence selection → grounded answering → reliability evaluation**.
 
-## Why this project
-Most RAG demos stop at “it works.” This project focuses on:
-- **Retriever quality** (recall/MRR/nDCG)
-- **Answer reliability** (correctness, groundedness, citation validity)
-- **Calibration + abstention** (coverage vs reliability tradeoffs)
-- **Actionable failure analysis** (tiering, recoverability)
+This repo is deliberately opinionated: it optimizes for **measurable reliability** (correct + grounded + citation-valid) over “fun demos”.
 
 ---
 
-## Data
-- Corpus and dialogues: Doc2Dial (ingested locally)
-- We build:
-  - `docs.jsonl` and `dialogues_{split}.jsonl`
-  - `grounding_map_{split}.jsonl`: maps each query to the gold document spans
-  - `chunks.jsonl`: chunked corpus for retrieval
+## Key Results (Headline)
 
-### Grounding
-We treat “correct retrieval” as retrieving a chunk that overlaps the **gold span(s)** associated with the query (not just “something vaguely relevant”).
+### Reliability patch (Rep slice, n=120; judge: `gpt-5-mini`)
+**Tiered Policy V2** improved answer quality while maintaining high coverage:
+
+- **Correctness:** 0.52 → **0.73**
+- **Grounded rate:** 0.72 → **0.99**
+- **Citation-valid rate:** 0.77 → **1.00**
+- **Answered coverage:** 0.50 → **0.74** (Tier C abstains)
+
+**So what:** V2 largely eliminates “confident but unsupported” answers by enforcing **cite-or-abstain**, producing near-perfect groundedness/citation validity at high coverage.
+
+### Retrieval (Full validation, n=3972)
+Hybrid retrieval provides the best candidate pool:
+
+- **Hybrid RRF (BM25 + OpenAI dense), k=30:** recall@30 **0.7059**, MRR **0.3822**, nDCG@30 **0.4519**
+
+### Local reranking (Rep slice, n=120; $0 credits)
+Local cross-encoder reranking improves **top-context ordering** in the window RAG actually uses:
+
+- Candidate pool: Hybrid RRF (top-30)
+- Reranker: `cross-encoder/ms-marco-MiniLM-L-6-v2` (GPU, no API calls)
+- **At k=5:** recall@5 **0.50 → 0.50** (unchanged), **MRR +0.039**, **nDCG@5 +0.030**
 
 ---
 
-## System overview
+## Core contribution (narrative arc)
 
-### Pipeline stages
-1) **Ingest → Grounding map → Chunking**
-2) **Retrieval**: BM25 baseline, dense embeddings, hybrid fusion (RRF)
-3) **Rerank**:
-   - **LLM reranker** (high-quality, costs credits)
-   - **Local cross-encoder reranker** (no credits; improves top-context ordering)
-4) **RAG generation**: answer + citations + abstain if unsupported
-5) **LLM-as-judge evaluation**
-6) **Calibration + tiered policy**: improve reliability via selective answering
+1) **Hybrid retrieval** builds a **high-recall** candidate pool (coverage).
+2) **Reranking** improves **top-k ordering** (quality of the contexts you actually feed to the LLM).
+3) **Tiered policy + calibration** makes the system **fail gracefully** (answer when confident; abstain when not), yielding large reliability gains.
 
 ---
 
-## Retrieval results (full validation, n=3972)
+## Architecture (ASCII)
 
-### Best retriever: Hybrid retrieval (BM25 + Dense via RRF)
-Hybrid retrieval provides a high-recall candidate pool for downstream reranking and generation:
+```
+Query
+  └─> Retrieve (BM25 + Dense)  ──────────────┐
+         └─> Fuse (RRF) → Candidate Pool k=30├─> (optional) Rerank (CE / LLM) → Top-k (k=5..10)
+                                             └─> Tier Policy (A/B/C) → Answer or Abstain
+                                                      └─> Judge + Calibration → Metrics + Failure reports
+```
 
-- k=30: recall@30 **0.706**, MRR **0.382**, nDCG@30 **0.452**
+Tier routing (conceptual):
 
-### Local PyTorch dense retriever (exact cosine; no FAISS)
-We implemented a local dense retriever using SentenceTransformers on GPU and **exact cosine top-k** (matmul + topk), caching chunk embeddings to disk.
+```
+m = score_top1 - score_top2
+
+if m >= 1.0:
+  Tier A: strict grounded answer + citations
+elif score_top1 >= 3.0:
+  Tier B: evidence-first; cite-or-abstain
+else:
+  Tier C: abstain (show top passages)
+```
+
+---
+
+## Repository conventions
+
+- CLI: `raglab ...` (Typer)
+- Runs: `runs/<timestamp>__<run_name>/`
+  - `config.json`, `metrics.json`, `predictions.jsonl`
+  - plus stage-specific outputs (e.g., `answers.jsonl`, `calibration.json`, `failures.csv`)
+
+---
+
+## Data + evaluation
+
+### Data products
+- `chunks.jsonl`: chunked document corpus (`chunk_id`, `text`, …)
+- `grounding_map_<split>_chunks.jsonl`: (`qid`, `question`, `gold_chunk_ids`, …)
+
+### Retrieval success criterion
+A retrieval is “correct” if any retrieved chunk overlaps the gold span(s) mapped to chunks (via `gold_chunk_ids`).
+
+---
+
+## Results
+
+### Retrieval comparison (full validation)
+
+| Retriever | Split | k | Recall@k | MRR | nDCG@k |
+|---|---:|---:|---:|---:|---:|
+| Hybrid RRF (BM25 + OpenAI dense) | validation | 30 | **0.7059** | **0.3822** | **0.4519** |
+| Local Dense Torch (MiniLM bi-encoder) | validation | 30 | 0.5687 | 0.2668 | 0.3300 |
+
+> Interpretation: MiniLM bi-encoder is not competitive as a primary retriever here; hybrid retrieval remains the best candidate pool.
+
+### Local dense retrieval (PyTorch, exact cosine; no FAISS)
+
+We implemented a local dense retriever using SentenceTransformers on GPU:
+- embed chunks once (cached to disk)
+- embed queries in batches
+- L2 normalize and compute cosine via `matmul`
+- top-k via `torch.topk`
 
 **Model:** `sentence-transformers/all-MiniLM-L6-v2` (dim=384)
 
-Observed performance is **worse than hosted embeddings + hybrid** on this dataset:
+- Rep slice (n=120, k=30): recall@30 **0.6083**, MRR **0.3264**, nDCG@30 **0.3831**
+- Full validation (n=3972, k=30): recall@30 **0.5687**, MRR **0.2668**, nDCG@30 **0.3300**
 
-- Full validation (k=30): recall@30 **0.569**, MRR **0.267**, nDCG@30 **0.330**
-- Rep slice (n=120, k=30): recall@30 **0.608**, MRR **0.326**, nDCG@30 **0.383**
+### Reranking comparison (rep slice; candidate pool fixed)
 
-Interpretation: a general-purpose MiniLM bi-encoder is not competitive here as a primary retriever, but it provides a reproducible local baseline and a foundation for future improvements (e.g., E5/BGE models, distillation).
+Reranking does **not** change candidate coverage; it changes ordering.
 
----
+| Candidate Pool | Reranker | k | Recall@k | MRR | nDCG@k |
+|---|---|---:|---:|---:|---:|
+| Hybrid RRF (top-30) | none | 5 | 0.5000 | 0.3816 | 0.3950 |
+| Hybrid RRF (top-30) | **Local cross-encoder** | 5 | 0.5000 | **0.4204** | **0.4248** |
 
-## Local cross-encoder reranking (rep slice, n=120)
+At k=10 (rep slice), reranking improved ordering (MRR/nDCG) but slightly reduced recall@10 (coverage in top-10):
+- Baseline: recall@10 0.5917, MRR 0.3816, nDCG@10 0.4224  
+- Reranked: recall@10 0.5750, MRR 0.4204, nDCG@10 0.4441
 
-Reranking improves **ordering within a fixed candidate pool** (MRR/nDCG), which matters most when RAG uses only the **top few** contexts.
+> Practical takeaway: cross-encoder reranking improves “how early the first relevant chunk appears” (MRR) in the top-k window; it does not add new candidates.
 
-We reranked the **Hybrid RRF candidate set** (top-30 per query) using a local cross-encoder:
-
-- **Model:** `cross-encoder/ms-marco-MiniLM-L-6-v2` (GPU)
-- **No API calls / no credits** (runs locally)
-
-### Impact at k=5 (RAG-relevant window)
-Baseline (Hybrid RRF, evaluated @5):
-- recall@5 **0.500**
-- MRR **0.382**
-- nDCG@5 **0.395**
-
-After local cross-encoder rerank (same candidate pool):
-- recall@5 **0.500** (unchanged)
-- MRR **0.420** (**+0.039**)
-- nDCG@5 **0.425** (**+0.030**)
-
-This indicates the reranker makes it **more likely the first relevant chunk is earlier** in the top-5 window, without reducing coverage at that cutoff.
-
-> Note: reranking does not add new candidates, so recall@30 for the same pool is unchanged; gains show up primarily in ranking quality (MRR/nDCG), especially for small k.
+Why recall@10 can drop: the cross-encoder sometimes **penalizes a borderline-but-relevant chunk** that the retriever ranked highly, while strongly promoting the best evidence upward—so ordering improves even if a few relevant items fall just outside the cutoff.
 
 ---
 
-## End-to-end RAG reliability (Rep Slice, n=120)
+## Tiered policy and reliability (rep slice, n=120)
 
-We evaluate answer behavior with an LLM judge:
-- **Correctness** (0–1)
-- **Groundedness** (0/1)
-- **Citation validity** (0/1)
-- **Answered coverage** (fraction not abstained)
-
-### Tiered policy (V1 → V2 Reliability Patch)
-We route queries based on reranker confidence:
-
-- **Tier A (high confidence):** margin(top1 - top2) ≥ 1 → strict grounded answer
-- **Tier B (medium confidence):** top1 ≥ 3 and margin < 1 → evidence-first answer (**cite-or-abstain enforced**)
-- **Tier C (low confidence):** abstain + show top passages (no LLM call)
-
-#### Overall (answered-only; weighted across tiers)
+### Tiered Policy V2 summary (judge: `gpt-5-mini`)
 | Version | Answered Coverage | Correctness (↑) | Grounded Rate (↑) | Citation Valid Rate (↑) |
 |---|---:|---:|---:|---:|
 | V1 | 0.50 | 0.52 | 0.72 | 0.77 |
-| V2 (gpt-5-mini) | 0.74 | 0.73 | 0.99 | 1.00 |
+| **V2** | **0.74** | **0.73** | **0.99** | **1.00** |
 
-#### V2 Tier Metrics (answered-only within tier)
+Tier metrics (answered-only within tier):
 | Tier | n | Answered Coverage | Correctness | Grounded | Citation Valid |
 |---|---:|---:|---:|---:|---:|
 | A_high | 50 | 0.92 | 0.73 | 0.98 | 1.00 |
@@ -115,14 +145,29 @@ We route queries based on reranker confidence:
 
 ---
 
-## How to reproduce
+## Setup
 
-### Setup
+### Environments
+- **Default env (`.venv`)**: core pipeline + OpenAI retrieval/rerank/judge
+- **Torch env (`.venv-torch`)**: GPU inference for local dense + cross-encoder reranking  
+  - Python **3.11**
+  - Torch **2.1.2+cu118** (CUDA 11.8)
+  - SentenceTransformers **2.2.2**
+
+Why no FAISS: corpus is small (~1506 chunks), and FAISS GPU wheels for cp311 can be painful; exact cosine is sufficient.
+
+Tip: use `.venv-torch` specifically for **GPU-bound local inference** (local dense retrieval, cross-encoder reranking), and keep `.venv` for the main pipeline and any OpenAI-dependent stages to avoid dependency conflicts.
+
+### Install
 ```bash
 python -m venv .venv
-# activate venv
+# activate .venv
 pip install -e .
 ```
+
+---
+
+## Reproduce (high level)
 
 ### Build processed data
 ```bash
@@ -135,15 +180,19 @@ python scripts/04_map_grounding_to_chunks.py
 
 ### Retrieval
 ```bash
-raglab run-bm25 --run-name bm25_a3_prod --split validation --k 10 --tokenizer a3
-raglab run-dense --run-name dense_prod --split validation --k 10 --dense-model text-embedding-3-small
-raglab run-hybrid-rrf --run-name hybrid_rrf_full_k30 --split validation --k 30 --dense-model text-embedding-3-small
+raglab run-bm25 --run-name bm25_validation_k30 --split validation --k 30 --tokenizer a3
+raglab run-dense --run-name dense_openai_validation_k30 --split validation --k 30 --dense-model text-embedding-3-small
+raglab run-hybrid-rrf --run-name hybrid_rrf_validation_k30 --split validation --k 30 --dense-model text-embedding-3-small
 ```
-### Local PyTorch dense retrieval (exact cosine)
+
+### Local dense retrieval (Torch)
+Run in `.venv-torch`:
 ```bash
 raglab run-local-dense-torch --run-name local_dense_torch_val --split validation --k 30
 ```
-### Local cross-encoder reranking (no credits)
+
+### Local cross-encoder reranking (Torch; no credits)
+Rerank an existing candidate pool (e.g., hybrid RRF rep slice) and evaluate at k=5:
 ```bash
 raglab run-rerank-cross-encoder-local \
   --run-name xenc_on_hybrid_rrf_rep_eval5 \
@@ -154,26 +203,28 @@ raglab run-rerank-cross-encoder-local \
   --use-samples
 ```
 
-### RAG + judge + tier analysis (rep slice)
+Evaluate any existing `predictions.jsonl` at a different cutoff:
 ```bash
-raglab run-rag --run-name rag_gen_rep_tiered_v2_q120 --use-samples --policy tiered_v1 --model gpt-5-mini ...
-raglab judge-rag --run-name rag_judge_rep_tiered_v2_q120 --use-samples --judge-model gpt-5-mini ...
-raglab analyze-tiers --run-name tiers_rep_tiered_v2_q120 --rag-gen-dir <...> --judge-dir <...>
+raglab eval-predictions \
+  --run-name eval_only_k10 \
+  --predictions-path runs/<timestamp>__hybrid_rrf_rep_k30/predictions.jsonl \
+  --split validation \
+  --k 10 \
+  --use-samples
 ```
 
 ---
 
-## Limitations
-- Reranking + judging uses an LLM, so scores reflect judge behavior (we mitigate with deterministic slices + reproducible runs).
-- Rep slice is small (n=120); full validation generation is possible but costly.
-- Local dense retriever (MiniLM) is not competitive vs hosted dense embeddings on this dataset without further tuning/model choice.
-- Cross-encoder reranking improves ranking quality but does not add candidates; recall gains require better retrieval.
+## Threats to validity + audit
+
+- **LLM-as-judge bias:** Judge quality can vary by model/prompt; we mitigate with deterministic rep slice and storing all artifacts.
+- **No inter-annotator agreement yet:** recommended next step is a small human audit on ~20 examples and compute agreement (e.g., **Cohen’s κ**) between judge vs human labels for **correctness / groundedness / citation-valid**.
+- **Rep slice size (n=120):** useful for iteration and ablation; full validation generation is possible but costly.
 
 ---
 
-## Extension roadmap
-- Try retrieval-optimized local bi-encoders (E5/BGE) with correct query/passage formatting
-- Distillation (teacher: hosted embeddings or cross-encoder; student: local bi-encoder)
-- Hybrid fusion using BM25 + local dense + RRF
-- Better confidence models (e.g., margin + entropy, or learned calibrator)
-- Richer failure taxonomy and auto-generated qualitative reports
+## Roadmap (bounded)
+- Try retrieval-optimized bi-encoders (E5/BGE) with correct query/passage formatting
+- Cross-encoder model sweep (quality vs latency)
+- Distillation: (teacher reranker) → (student bi-encoder) to improve local dense retrieval
+- Learned confidence model (beyond margin) + stronger calibration reports
