@@ -50,5 +50,39 @@ Tradeoff: overlap can inflate recall if too large; kept modest.
 **Decision:** use judge scores for correctness/grounded/citation-valid and evaluate coverage–reliability tradeoffs.  
 **Why:** scalable, structured evaluation for end-to-end behavior (retrieval metrics alone are insufficient).
 
-## Extension: PyTorch local embeddings (planned)
-**Goal:** implement local embedding model + ANN index (FAISS) and compare with hosted embeddings on quality/cost/latency.
+## 9) Local dense retrieval (PyTorch, exact cosine; no FAISS)
+**Decision:** implement local dense retrieval using SentenceTransformers on GPU with **exact cosine similarity** (L2 normalize + matmul + topk) and cache chunk embeddings to disk; avoid FAISS.  
+**Why:**
+- corpus is small (~1506 chunks), so exact search is fast and simple
+- avoids FAISS GPU wheel issues on cp311
+- caching makes repeated runs cheap (embed corpus once; embed queries per run)
+
+**Outcome:** baseline MiniLM bi-encoder underperformed hosted dense + hybrid on this dataset (lower recall/MRR/nDCG), so we treat it as a reproducible local baseline and a foundation for future improvements (E5/BGE, distillation).
+
+Alternatives:
+- FAISS ANN index (blocked by packaging constraints; unnecessary at current corpus size)
+- quantized ANN (premature optimization)
+
+---
+
+## 10) Local cross-encoder reranking (no credits)
+**Decision:** add an inference-only local cross-encoder reranker on top of the hybrid candidate pool.  
+**Why:**
+- improves **top-context ordering** where RAG is most sensitive (top 3–5 chunks)
+- runs with $0 API cost and provides a reproducible offline dev loop
+- clean separation of concerns: retrieval for coverage; rerank for ordering
+
+**Measured effect (rep slice):**
+- recall@5 unchanged while **MRR and nDCG@5 improved** (better ordering within fixed pool)
+
+Alternatives:
+- train/fine-tune a reranker (more scope; save for follow-up work)
+- distillation into a bi-encoder (more novel, but larger pipeline and training loop)
+
+---
+
+## Extension roadmap
+- Try retrieval-optimized local bi-encoders (E5/BGE) with correct query/passage prefixes
+- Distillation: teacher (hosted embeddings or cross-encoder) → student (local bi-encoder)
+- Hybrid fusion: BM25 + local dense + RRF (evaluate complementarity)
+- Improve confidence models (beyond margin), and add learned calibrators

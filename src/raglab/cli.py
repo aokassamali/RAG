@@ -18,6 +18,10 @@ from raglab.analysis.failures import failure_rows
 from raglab.indexing.dense_openai import OpenAIDenseRetriever, DenseIndex
 from raglab.rerank.llm_openai import score_passages
 from raglab.rerank.llm_batch import rerank_passages_one_call
+from raglab.indexing.local_dense_torch import LocalTorchDenseRetriever, TorchDenseConfig
+from raglab.rerank.cross_encoder_local import CrossEncoderLocalReranker, CrossEncoderLocalConfig
+
+
 
 app = typer.Typer(add_completion=False)
 
@@ -929,3 +933,303 @@ def run_tiered_e2e(
 
     typer.echo(f"Gen dir:   {gen_dir}")
     typer.echo(f"Judge dir: {judge_dir}")
+
+@app.command()
+def run_local_dense_torch(
+    run_name: str = typer.Option("local_dense_torch_v1", help="Run name"),
+    split: str = typer.Option("validation", help="train|validation"),
+    k: int = typer.Option(10, help="Top-K"),
+    use_samples: bool = typer.Option(False),
+    sample_queries_only: bool = typer.Option(False),
+    model_name: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", help="SentenceTransformers model"),
+    cache_root: str = typer.Option("artifacts/local_dense_torch", help="Shared embedding cache dir (relative to repo root)"),
+    cache_dtype: str = typer.Option("float16", help="float16|float32"),
+    chunk_batch_size: int = typer.Option(128),
+    query_batch_size: int = typer.Option(128),
+    device: str = typer.Option("cuda", help="cuda|cpu"),
+    force_rebuild: bool = typer.Option(False, help="Re-embed chunks even if cache exists"),
+):
+    # What this does and why:
+    # - Builds/loads cached chunk embeddings (one-time per corpus fingerprint)
+    # - Embeds queries in batches
+    # - Exact cosine via matmul + topk
+    # - Writes artifacts identical to run_dense/run_bm25 (predictions/metrics/calibration/failures/manifest)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    runs_root = repo_root / "runs"
+    run_dir = make_run_dir(runs_root, run_name)
+
+    # Make cache path relative to repo root so it’s stable across machines/runs.
+    cache_path = str((repo_root / cache_root).resolve())
+
+    chunks = load_chunks(repo_root, use_samples=use_samples, sample_queries_only=sample_queries_only)
+    gold = load_grounding(repo_root, split=split, use_samples=use_samples)
+
+    cfg = TorchDenseConfig(
+        model_name=model_name,
+        device=device,
+        chunk_batch_size=chunk_batch_size,
+        query_batch_size=query_batch_size,
+        cache_dtype=cache_dtype,
+        cache_root=cache_path,
+        normalize=True,
+    )
+    retriever = LocalTorchDenseRetriever(cfg)
+
+    chunk_ids, chunk_emb, index_meta = retriever.build_or_load_index(
+        chunks,
+        id_key="chunk_id",
+        text_key="text",
+        force_rebuild=force_rebuild,
+    )
+
+    # Batch retrieval (faster than per-query calls)
+    questions = [ex["question"] for ex in gold]
+    pred_lists = retriever.retrieve_many(
+        questions,
+        top_k=k,
+        chunk_ids=chunk_ids,
+        chunk_emb=chunk_emb,
+    )
+
+    preds = []
+    confs = []
+    accs = []
+
+    for ex, p in zip(gold, pred_lists):
+        preds.append({"qid": ex["qid"], "preds": p})
+
+        pred_ids = [x["chunk_id"] for x in p]
+        gold_set = set(ex["gold_chunk_ids"])
+        hit = recall_at_k(pred_ids, gold_set, k)
+        accs.append(float(hit))
+        confs.append(float(confidence_from_scores(p)))
+
+    metrics = evaluate_retrieval(gold, preds, k=k)
+
+    cal = {
+        "confidence_proxy": "sigmoid(score_top1 - score_top2)",
+        "ece": ece(confs, accs, n_bins=10),
+        "coverage_accuracy": coverage_accuracy_curve(confs, accs, points=20),
+    }
+
+    chunk_map = chunk_text_map(chunks)
+    fails = failure_rows(gold, preds, k=k, chunk_text_by_id=chunk_map)
+    fails_df = pd.DataFrame(fails)
+
+    write_json(run_dir / "config.json", {
+        "retriever": "local_dense_torch",
+        "model_name": model_name,
+        "device": device,
+        "k": k,
+        "split": split,
+        "use_samples": use_samples,
+        "sample_queries_only": sample_queries_only,
+        "chunk_batch_size": chunk_batch_size,
+        "query_batch_size": query_batch_size,
+        "cache_root": cache_root,
+        "cache_dtype": cache_dtype,
+        "force_rebuild": force_rebuild,
+        "index_meta": index_meta,
+    })
+    write_json(run_dir / "metrics.json", metrics)
+    write_json(run_dir / "calibration.json", cal)
+    write_jsonl(run_dir / "predictions.jsonl", preds)
+    fails_df.to_csv(run_dir / "failures.csv", index=False)
+
+    write_manifest(run_dir, extra={"dataset": {"chunks": len(chunks), "queries": len(gold)}})
+
+    typer.echo(f"Run dir: {run_dir}")
+    typer.echo(f"Metrics: {metrics}")
+    typer.echo(f"Failures: {len(fails_df)} -> {run_dir / 'failures.csv'}")
+
+@app.command()
+def run_rerank_cross_encoder_local(
+    run_name: str = typer.Option("rerank_xenc_local_v1"),
+    input_run_dir: str = typer.Option(..., help="Run dir containing predictions.jsonl (candidate pool)"),
+    split: str = typer.Option("validation"),
+    top_n: int = typer.Option(30, help="How many candidates per query to rerank from the input run"),
+    k_eval: int = typer.Option(10, help="Evaluate at K after reranking (RAG-relevant)"),
+    model: str = typer.Option("cross-encoder/ms-marco-MiniLM-L-6-v2", help="Cross-encoder model"),
+    device: str = typer.Option("cuda", help="cuda|cpu"),
+    batch_size: int = typer.Option(64),
+    max_chars_per_passage: int = typer.Option(900),
+    use_samples: bool = typer.Option(True, help="Use deterministic sample queries (120)"),
+    chunks_path: str = typer.Option("", help="Optional explicit path to chunks.jsonl (overrides load_chunks)"),
+):
+    # What this command does and why:
+    # - Reads an existing retrieval run's predictions.jsonl (candidate pool)
+    # - Reranks top_n candidates per query using a local cross-encoder (no credits)
+    # - Evaluates at k_eval (default 10) to reflect top-context quality for RAG
+
+    from pathlib import Path
+    import pandas as pd
+
+    repo_root = Path(__file__).resolve().parents[2]
+    runs_root = repo_root / "runs"
+    run_dir = make_run_dir(runs_root, run_name)
+
+    # Load gold + chunks
+    gold = load_grounding(repo_root, split=split, use_samples=use_samples)
+
+    if chunks_path.strip():
+        chunks = read_jsonl(Path(chunks_path))
+    else:
+        chunks = load_chunks(repo_root, use_samples=False, sample_queries_only=False)
+
+    text_by_id = chunk_text_map(chunks)
+
+    # Load input candidates
+    input_dir = Path(input_run_dir)
+    base_preds = read_jsonl(input_dir / "predictions.jsonl")
+    base_by_qid = {r["qid"]: r for r in base_preds}
+    gold_by_qid = {g["qid"]: g for g in gold}
+
+    reranker = CrossEncoderLocalReranker(CrossEncoderLocalConfig(
+        model_name=model,
+        device=device,
+        batch_size=batch_size,
+        max_chars_per_passage=max_chars_per_passage,
+    ))
+
+    preds = []
+    confs, accs = [], []
+
+    for ex in gold:
+        qid = ex["qid"]
+        question = ex["question"]
+
+        base = base_by_qid.get(qid, {"qid": qid, "preds": []})
+        cand = base.get("preds", [])[:top_n]
+
+        # Build (chunk_id, text) for reranking
+        pairs = []
+        for p in cand:
+            cid = p["chunk_id"]
+            txt = text_by_id.get(cid)
+            if txt is not None:
+                pairs.append((cid, txt))
+
+        if not pairs:
+            new_preds = []
+        else:
+            reranked = reranker.rerank(question, pairs)
+            new_preds = [{"chunk_id": cid, "score": float(sc)} for cid, sc in reranked]
+
+        preds.append({"qid": qid, "preds": new_preds})
+
+        # Eval confidence proxy + hit@k_eval (for calibration)
+        pred_ids = [x["chunk_id"] for x in new_preds]
+        gold_set = set(ex["gold_chunk_ids"])
+        hit = recall_at_k(pred_ids, gold_set, k_eval)
+        accs.append(float(hit))
+        confs.append(float(confidence_from_scores(new_preds)))
+
+    metrics = evaluate_retrieval(gold, preds, k=k_eval)
+    cal = {
+        "confidence_proxy": "sigmoid(score_top1 - score_top2) [cross-encoder score]",
+        "ece": ece(confs, accs, n_bins=10),
+        "coverage_accuracy": coverage_accuracy_curve(confs, accs, points=20),
+    }
+
+    fails = failure_rows(gold, preds, k=k_eval, chunk_text_by_id=text_by_id)
+    pd.DataFrame(fails).to_csv(run_dir / "failures.csv", index=False)
+
+    write_json(run_dir / "config.json", {
+        "stage": "rerank_cross_encoder_local",
+        "input_run_dir": str(input_dir),
+        "split": split,
+        "use_samples": use_samples,
+        "top_n": top_n,
+        "k_eval": k_eval,
+        "model": model,
+        "device": device,
+        "batch_size": batch_size,
+        "max_chars_per_passage": max_chars_per_passage,
+        "chunks_path": chunks_path,
+    })
+    write_json(run_dir / "metrics.json", metrics)
+    write_json(run_dir / "calibration.json", cal)
+    write_jsonl(run_dir / "predictions.jsonl", preds)
+    write_manifest(run_dir, extra={"dataset": {"chunks": len(chunks), "queries": len(gold)}})
+
+    typer.echo(f"Run dir: {run_dir}")
+    typer.echo(f"Metrics: {metrics}")
+
+@app.command()
+def eval_predictions(
+    run_name: str = typer.Option("eval_only", help="Run name"),
+    predictions_path: str = typer.Option(..., help="Path to predictions.jsonl to evaluate"),
+    split: str = typer.Option("validation", help="train|validation"),
+    k: int = typer.Option(10, help="Evaluate at K (does NOT rerun retrieval)"),
+    use_samples: bool = typer.Option(True, help="If the predictions are for the 120-query sample"),
+    sample_queries_only: bool = typer.Option(False, help="Match how you sampled queries"),
+):
+    # What this does and why:
+    # - Evaluates an existing predictions.jsonl at a chosen K without rerunning retrieval.
+    # - Lets you compute baseline @10 metrics for an already-computed @30 candidate pool (no credits).
+
+    repo_root = Path(__file__).resolve().parents[2]
+    runs_root = repo_root / "runs"
+    run_dir = make_run_dir(runs_root, run_name)
+
+    # Load gold (match sampling mode to the predictions file)
+    gold = load_grounding(repo_root, split=split, use_samples=use_samples)
+
+    # Load chunks for failures.csv context snippets
+    chunks = load_chunks(repo_root, use_samples=False, sample_queries_only=False)
+    chunk_map = chunk_text_map(chunks)
+
+    preds = read_jsonl(Path(predictions_path))
+
+    # Calibration target = hit@K (same pattern as your retriever runs)
+    gold_by_qid = {g["qid"]: g for g in gold}
+    confs, accs = [], []
+    kept_preds = []
+
+    for row in preds:
+        qid = row.get("qid")
+        p = row.get("preds", [])
+        if qid is None:
+            continue
+
+        g = gold_by_qid.get(qid)
+        if g is None:
+            continue  # skip preds not in this gold set
+
+        kept_preds.append({"qid": qid, "preds": p})
+
+        pred_ids = [x["chunk_id"] for x in p]
+        gold_set = set(g["gold_chunk_ids"])
+        hit = recall_at_k(pred_ids, gold_set, k)
+        accs.append(float(hit))
+        confs.append(float(confidence_from_scores(p)))
+
+    metrics = evaluate_retrieval(gold, kept_preds, k=k)
+
+    cal = {
+        "confidence_proxy": "sigmoid(score_top1 - score_top2)",
+        "ece": ece(confs, accs, n_bins=10),
+        "coverage_accuracy": coverage_accuracy_curve(confs, accs, points=20),
+    }
+
+    fails = failure_rows(gold, kept_preds, k=k, chunk_text_by_id=chunk_map)
+    pd.DataFrame(fails).to_csv(run_dir / "failures.csv", index=False)
+
+    write_json(run_dir / "config.json", {
+        "stage": "eval_only",
+        "predictions_path": str(predictions_path),
+        "split": split,
+        "k": k,
+        "use_samples": use_samples,
+        "sample_queries_only": sample_queries_only,
+        "n_preds_rows": len(preds),
+        "n_eval_rows": len(kept_preds),
+    })
+    write_json(run_dir / "metrics.json", metrics)
+    write_json(run_dir / "calibration.json", cal)
+    write_jsonl(run_dir / "predictions.jsonl", kept_preds)
+    write_manifest(run_dir, extra={"dataset": {"chunks": len(chunks), "queries": len(gold)}})
+
+    typer.echo(f"Run dir: {run_dir}")
+    typer.echo(f"Metrics: {metrics}")
