@@ -9,7 +9,9 @@ src/raglab.egg-info/dependency_links.txt
 src/raglab.egg-info/entry_points.txt
 src/raglab.egg-info/requires.txt
 src/raglab.egg-info/top_level.txt
+src/raglab/analysis/calibration.py
 src/raglab/analysis/failures.py
+src/raglab/analysis/tiers.py
 src/raglab/chunking/chunkers.py
 src/raglab/chunking/validate.py
 src/raglab/data/loaders.py
@@ -21,8 +23,12 @@ src/raglab/indexing/dense_openai.py
 src/raglab/indexing/hybrid.py
 src/raglab/ingestion/__init__.py
 src/raglab/ingestion/doc2dial.py
+src/raglab/rag/generate.py
+src/raglab/rag/judge.py
 src/raglab/rag/pipeline.py
 src/raglab/rag/prompts.py
+src/raglab/rerank/llm_batch.py
+src/raglab/rerank/llm_openai.py
 src/raglab/utils/hashing.py
 src/raglab/utils/io.py
 src/raglab/utils/run_artifacts.py
