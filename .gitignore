@@ -9,7 +9,6 @@ runs/
 # Hugging Face / model caches (if you ever set them locally)
 .hf/
 .cache/
-.artifacts/
 
 # Python
 .venv/
