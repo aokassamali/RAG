@@ -1,0 +1,10 @@
+{
+  "fingerprint": "b7f5973b60bee2d7",
+  "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+  "device_built": "cuda",
+  "normalize": true,
+  "cache_dtype": "float16",
+  "num_chunks": 1506,
+  "dim": 384,
+  "cache_dir": "C:\\Users\\aokas\\RAG\\artifacts\\local_dense_torch\\sentence-transformers__all-MiniLM-L6-v2\\b7f5973b60bee2d7"
+}
